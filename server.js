@@ -128,6 +128,21 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
+const visitorSchema = new mongoose.Schema({
+  visitorId: { type: String, required: true, unique: true },
+  user_id: { type: Number, default: null },
+  username: { type: String, default: '' },
+  firstName: { type: String, default: '' },
+  mode: { type: String, default: 'guest' },
+  nick: { type: String, default: '' },
+  studyMin: { type: Number, default: 0 },
+  workouts: { type: Number, default: 0 },
+  streak: { type: Number, default: 0 },
+  lastSeen: { type: Number, default: Date.now },
+  visits: { type: Number, default: 0 }
+});
+const Visitor = mongoose.model('Visitor', visitorSchema);
+
 function verifyTelegramWebAppData(telegramInitData) {
   if (!telegramInitData || !BOT_TOKEN) return { ok: false, reason: !BOT_TOKEN ? 'no_token' : 'empty_initData' };
   try {
@@ -251,6 +266,80 @@ app.post('/api/save', async (req, res) => {
   } catch (error) {
     console.error('Ошибка /api/save:', error.message);
     res.status(500).json({ error: 'Ошибка сохранения: ' + error.message });
+  }
+});
+
+// 1. Приём пинга при каждом входе (и Telegram, и гости)
+app.post('/api/ping', async (req, res) => {
+  const { visitorId, user_id, username, firstName, mode, nick, studyMin, workouts, streak, ts } = req.body || {};
+  if (!visitorId) return res.status(400).json({ ok: false });
+
+  const connected = await connectDB();
+  if (!connected) return res.status(503).json({ ok: false });
+
+  try {
+    await Visitor.findOneAndUpdate(
+      { visitorId: String(visitorId) },
+      {
+        $set: {
+          visitorId: String(visitorId),
+          user_id: Number.isFinite(Number(user_id)) ? Number(user_id) : null,
+          username: String(username || '').slice(0, 64),
+          firstName: String(firstName || '').slice(0, 64),
+          mode: mode === 'telegram' ? 'telegram' : 'guest',
+          nick: String(nick || '').slice(0, 64),
+          studyMin: Number(studyMin) || 0,
+          workouts: Number(workouts) || 0,
+          streak: Number(streak) || 0,
+          lastSeen: Number(ts) || Date.now()
+        },
+        $inc: { visits: 1 }
+      },
+      { upsert: true }
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Ошибка /api/ping:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Отдача рейтинга и списка визитов для админ-вкладки «Рейтинг»
+app.post('/api/leaderboard', async (req, res) => {
+  const connected = await connectDB();
+  if (!connected) {
+    return res.status(503).json({ error: 'Нет подключения к MongoDB' });
+  }
+
+  try {
+    const [users, visitors] = await Promise.all([
+      User.find({}).lean(),
+      Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean()
+    ]);
+
+    const usernameByTgId = new Map();
+    for (const v of visitors) {
+      if (v.user_id && v.username) usernameByTgId.set(Number(v.user_id), v.username);
+    }
+
+    const leaderboard = users
+      .map(u => {
+        const st = u.data || {};
+        return {
+          user_id: u.telegramId,
+          username: usernameByTgId.get(Number(u.telegramId)) || '',
+          nick: st?.profile?.nick || 'Игрок',
+          studyMin: st?.stats?.min || 0,
+          workouts: st?.stats?.wk || 0,
+          streak: st?.streak?.cur || 0
+        };
+      })
+      .filter(u => u.studyMin > 0 || u.workouts > 0 || u.streak > 0);
+
+    res.json({ leaderboard, visitors });
+  } catch (error) {
+    console.error('Ошибка /api/leaderboard:', error.message);
+    res.status(500).json({ error: 'Ошибка загрузки рейтинга: ' + error.message });
   }
 });
 
