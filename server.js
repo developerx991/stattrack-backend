@@ -11,7 +11,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Функция обхода ошибки querySrv ENODATA через защищенный HTTPS-запрос к Google DNS
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
+const RAW_MONGO_URI = (process.env.MONGODB_URI || '').trim();
+
+let dbConnecting = null;
+let lastDbError = '';
+
+// Резервный обход ошибки querySrv ENODATA через защищенный HTTPS-запрос к Google DNS
 async function resolveMongoUri(uri) {
   if (!uri || !uri.startsWith('mongodb+srv://')) return uri;
 
@@ -25,11 +31,9 @@ async function resolveMongoUri(uri) {
 
     if (!srvJson.Answer || srvJson.Answer.length === 0) {
       console.error(`⚠️ У домена ${srvHost} нет активных SRV-записей в DNS!`);
-      console.error(`👉 Проверь сайт MongoDB Atlas (вкладка Database/Clusters): возможно, кластер ещё создаётся, поставлен на паузу (Paused) или его адрес изменился.`);
       return uri;
     }
 
-    // Собираем прямые адреса нод (шардов)
     const hosts = srvJson.Answer
       .filter(a => a.type === 33)
       .map(a => {
@@ -39,7 +43,6 @@ async function resolveMongoUri(uri) {
         return `${target}:${port}`;
       });
 
-    // Получаем дополнительные параметры (replicaSet и authSource) из TXT-записи
     const txtRes = await fetch(`https://dns.google/resolve?name=${srvHost}&type=TXT`);
     const txtJson = await txtRes.json();
     const extraParams = new URLSearchParams(parsed.search);
@@ -68,63 +71,169 @@ async function resolveMongoUri(uri) {
   }
 }
 
-// Подключение к базе данных
-(async () => {
-  const finalUri = await resolveMongoUri(process.env.MONGODB_URI);
-  mongoose.connect(finalUri)
-    .then(() => console.log('✅ Успешное подключение к MongoDB Atlas!'))
-    .catch(err => console.error('❌ Ошибка подключения к БД:', err.message));
-})();
+async function connectDB() {
+  if (mongoose.connection.readyState === 1) return true;
+  if (dbConnecting) return dbConnecting;
+
+  dbConnecting = (async () => {
+    if (!RAW_MONGO_URI) {
+      lastDbError = 'MONGODB_URI не задан в переменных окружения';
+      console.error('❌ ' + lastDbError);
+      return false;
+    }
+
+    const opts = {
+      serverSelectionTimeoutMS: 8000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 20000
+    };
+
+    // Сначала пробуем прямое подключение (на Render работает быстрее и стабильнее)
+    try {
+      await mongoose.connect(RAW_MONGO_URI, opts);
+      lastDbError = '';
+      console.log('✅ Успешное подключение к MongoDB Atlas!');
+      return true;
+    } catch (err) {
+      console.warn('⚠️ Прямое подключение не удалось:', err.message);
+      if (/ENODATA|ENOTFOUND|querySrv/i.test(err.message) && RAW_MONGO_URI.startsWith('mongodb+srv://')) {
+        try {
+          const directUri = await resolveMongoUri(RAW_MONGO_URI);
+          await mongoose.connect(directUri, opts);
+          lastDbError = '';
+          console.log('✅ Успешное подключение к MongoDB Atlas через DoH!');
+          return true;
+        } catch (err2) {
+          lastDbError = err2.message;
+          console.error('❌ Ошибка подключения к БД (DoH):', err2.message);
+          return false;
+        }
+      }
+      lastDbError = err.message;
+      console.error('❌ Ошибка подключения к БД:', err.message);
+      return false;
+    }
+  })().finally(() => {
+    dbConnecting = null;
+  });
+
+  return dbConnecting;
+}
+
+connectDB();
 
 const userSchema = new mongoose.Schema({
   telegramId: { type: Number, required: true, unique: true },
-  data: { type: Object, default: {} }
+  data: { type: Object, default: null }
 });
 const User = mongoose.model('User', userSchema);
 
 function verifyTelegramWebAppData(telegramInitData) {
-  if (!telegramInitData) return false;
-  const urlParams = new URLSearchParams(telegramInitData);
-  const hash = urlParams.get('hash');
-  urlParams.delete('hash');
-  urlParams.sort();
-  
-  let dataCheckString = '';
-  for (const [key, value] of urlParams.entries()) {
-    dataCheckString += `${key}=${value}\n`;
+  if (!telegramInitData || !BOT_TOKEN) return false;
+  try {
+    const urlParams = new URLSearchParams(telegramInitData);
+    const hash = urlParams.get('hash');
+    if (!hash) return false;
+    urlParams.delete('hash');
+    urlParams.sort();
+
+    let dataCheckString = '';
+    for (const [key, value] of urlParams.entries()) {
+      dataCheckString += `${key}=${value}\n`;
+    }
+    dataCheckString = dataCheckString.slice(0, -1);
+
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+    const calculatedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    return calculatedHash === hash;
+  } catch (e) {
+    return false;
   }
-  dataCheckString = dataCheckString.slice(0, -1);
-  
-  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(process.env.BOT_TOKEN).digest();
-  const calculatedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-  return calculatedHash === hash;
 }
 
-app.post('/api/load', async (req, res) => {
-  const { initData, user_id } = req.body;
-  if (!verifyTelegramWebAppData(initData)) return res.status(403).json({ error: 'Доступ запрещен' });
-  
+function extractTelegramUserId(telegramInitData, fallbackId) {
   try {
-    let user = await User.findOne({ telegramId: user_id });
+    const rawUser = new URLSearchParams(telegramInitData).get('user');
+    if (rawUser) {
+      const parsed = JSON.parse(rawUser);
+      if (parsed && parsed.id) return Number(parsed.id);
+    }
+  } catch (e) {}
+  return Number(fallbackId);
+}
+
+// Быстрая проверка состояния сервера и БД: откройте https://stattrack-backend.onrender.com/api/health
+app.get(['/', '/api/health'], (req, res) => {
+  res.json({
+    ok: true,
+    dbConnected: mongoose.connection.readyState === 1,
+    hasBotToken: Boolean(BOT_TOKEN),
+    hasMongoUri: Boolean(RAW_MONGO_URI),
+    dbError: lastDbError || undefined
+  });
+});
+
+app.post('/api/load', async (req, res) => {
+  const { initData, user_id } = req.body || {};
+  if (!BOT_TOKEN) {
+    return res.status(500).json({ error: 'На сервере не задан BOT_TOKEN (проверь Environment Variables на Render)' });
+  }
+  if (!verifyTelegramWebAppData(initData)) {
+    return res.status(403).json({ error: 'Подпись Telegram не прошла проверку (проверь BOT_TOKEN на Render)' });
+  }
+
+  const tgId = extractTelegramUserId(initData, user_id);
+  if (!Number.isFinite(tgId)) {
+    return res.status(400).json({ error: 'Некорректный user_id' });
+  }
+
+  const connected = await connectDB();
+  if (!connected) {
+    return res.status(503).json({ error: 'Нет подключения к MongoDB: ' + (lastDbError || 'проверь MONGODB_URI и Network Access 0.0.0.0/0 в Atlas') });
+  }
+
+  try {
+    let user = await User.findOne({ telegramId: tgId });
     if (!user) {
-      user = new User({ telegramId: user_id, data: null });
+      user = new User({ telegramId: tgId, data: null });
       await user.save();
     }
     res.json(user.data);
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка БД' });
+    console.error('Ошибка /api/load:', error.message);
+    res.status(500).json({ error: 'Ошибка БД: ' + error.message });
   }
 });
 
 app.post('/api/save', async (req, res) => {
-  const { initData, user_id, state } = req.body;
-  if (!verifyTelegramWebAppData(initData)) return res.status(403).json({ error: 'Доступ запрещен' });
-  
+  const { initData, user_id, state } = req.body || {};
+  if (!BOT_TOKEN) {
+    return res.status(500).json({ error: 'На сервере не задан BOT_TOKEN' });
+  }
+  if (!verifyTelegramWebAppData(initData)) {
+    return res.status(403).json({ error: 'Доступ запрещен' });
+  }
+
+  const tgId = extractTelegramUserId(initData, user_id);
+  if (!Number.isFinite(tgId)) {
+    return res.status(400).json({ error: 'Некорректный user_id' });
+  }
+
+  const connected = await connectDB();
+  if (!connected) {
+    return res.status(503).json({ error: 'Нет подключения к MongoDB' });
+  }
+
   try {
-    await User.findOneAndUpdate({ telegramId: user_id }, { data: state }, { upsert: true });
-    res.status(200).send('Сохранено');
+    await User.findOneAndUpdate(
+      { telegramId: tgId },
+      { data: state },
+      { upsert: true }
+    );
+    res.status(200).json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка сохранения' });
+    console.error('Ошибка /api/save:', error.message);
+    res.status(500).json({ error: 'Ошибка сохранения: ' + error.message });
   }
 });
 
