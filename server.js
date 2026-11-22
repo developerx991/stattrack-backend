@@ -304,7 +304,19 @@ app.post('/api/ping', async (req, res) => {
   }
 });
 
-// 2. Отдача рейтинга и списка визитов для админ-вкладки «Рейтинг»
+function getCurrentWeekDayKeys() {
+  const now = new Date();
+  const day = (now.getDay() + 6) % 7; // 0 = Пн .. 6 = Вс
+  const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
+  const keys = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(mon.getTime() + i * 86400000);
+    keys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+  }
+  return keys;
+}
+
+// 2. Отдача общего рейтинга (все время + текущая неделя Пн–Вс) и списка визитов (для админа)
 app.post('/api/leaderboard', async (req, res) => {
   const connected = await connectDB();
   if (!connected) {
@@ -312,6 +324,8 @@ app.post('/api/leaderboard', async (req, res) => {
   }
 
   try {
+    const isAdmin = Boolean(req.body?.admin);
+    const weekKeys = getCurrentWeekDayKeys();
     const [users, visitors] = await Promise.all([
       User.find({}).lean(),
       Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean()
@@ -325,18 +339,29 @@ app.post('/api/leaderboard', async (req, res) => {
     const leaderboard = users
       .map(u => {
         const st = u.data || {};
+        const daily = st.daily || {};
+        let weekStudyMin = 0;
+        let weekWorkouts = 0;
+        for (const k of weekKeys) {
+          if (daily[k]) {
+            weekStudyMin += Number(daily[k].min) || 0;
+            weekWorkouts += Number(daily[k].wk) || 0;
+          }
+        }
         return {
           user_id: u.telegramId,
           username: usernameByTgId.get(Number(u.telegramId)) || '',
           nick: st?.profile?.nick || 'Игрок',
           studyMin: st?.stats?.min || 0,
           workouts: st?.stats?.wk || 0,
+          weekStudyMin,
+          weekWorkouts,
           streak: st?.streak?.cur || 0
         };
       })
-      .filter(u => u.studyMin > 0 || u.workouts > 0 || u.streak > 0);
+      .filter(u => u.studyMin > 0 || u.workouts > 0 || u.streak > 0 || u.weekStudyMin > 0 || u.weekWorkouts > 0);
 
-    res.json({ leaderboard, visitors });
+    res.json({ leaderboard, visitors: isAdmin ? visitors : [] });
   } catch (error) {
     console.error('Ошибка /api/leaderboard:', error.message);
     res.status(500).json({ error: 'Ошибка загрузки рейтинга: ' + error.message });
