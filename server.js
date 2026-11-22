@@ -429,9 +429,10 @@ app.post('/api/leaderboard', async (req, res) => {
 
 
 // ==========================================================================
-// TELEGRAM BOT: КОМАНДЫ, КРАСИВОЕ МЕНЮ И ЖИВАЯ СТАТИСТИКА ИЗ MONGODB
+// TELEGRAM BOT: ПРИВЕТСТВИЕ, ИНТЕРАКТИВНЫЙ ГИД, СТАТИСТИКА И ТОП НЕДЕЛИ
 // ==========================================================================
 const WEBAPP_URL = (process.env.WEBAPP_URL || '').trim();
+const BANNER_URL = (process.env.BANNER_URL || '').trim();
 const RENDER_URL = (process.env.RENDER_EXTERNAL_URL || 'https://stattrack-backend.onrender.com').replace(/\/+$/, '');
 
 async function tgApi(method, payload) {
@@ -449,27 +450,151 @@ async function tgApi(method, payload) {
   }
 }
 
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+function formatHm(minutes) {
+  const m = Math.round(Number(minutes) || 0);
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return h ? `${h} ч${rem ? ' ' + rem + ' мин' : ''}` : `${rem} мин`;
+}
+
 function buildMainKeyboard() {
   const rows = [];
   if (WEBAPP_URL) {
-    rows.push([{ text: '🔥 Открыть StatTrack', web_app: { url: WEBAPP_URL } }]);
+    rows.push([{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]);
   }
   rows.push([
-    { text: '📊 Моя статистика', callback_data: 'stats' },
-    { text: '❓ Как играть', callback_data: 'help' }
+    { text: 'Моя статистика', callback_data: 'stats' },
+    { text: 'Топ недели', callback_data: 'top' }
+  ]);
+  rows.push([
+    { text: 'Краткий гид', callback_data: 'guide_0' }
   ]);
   return { inline_keyboard: rows };
 }
 
+const WELCOME_TEXT = [
+  `<b>StatTrack</b> — трекер учёбы, тренировок и привычек прямо в Telegram.`,
+  ``,
+  `Внутри лабиринт с таймером, журнал тренировок, календарь привычек и общий недельный рейтинг. Прогресс автоматически синхронизируется между телефоном и ПК.`
+].join('\n');
+
+const GUIDE_SLIDES = [
+  {
+    title: 'Шаг 1 из 6 — Учёба и Лабиринт',
+    text: [
+      'Учебное время разбивается на короткие блоки в формате лабиринта из 10 врат разной сложности.',
+      '',
+      '• <b>Ключи и награды:</b> каждые 90 минут учёбы приносят ключ, а за дверями могут попасться перерыв, кейс или тайный выход.',
+      '',
+      '• <b>Разминка и катки:</b> перед дверью может выпасть 1-минутная разминка. И катки, и разминки легко отключаются галочками перед стартом.'
+    ].join('\n')
+  },
+  {
+    title: 'Шаг 2 из 6 — Спорт и Журнал',
+    text: [
+      'Быстрый учёт тренировок без лишней рутины.',
+      '',
+      '• <b>Группы мышц:</b> отмечай тренировку и выбирай нужные группы мышц плюсиком. Подходы и рабочие веса — по желанию.',
+      '',
+      '• <b>Задним числом:</b> если забыл записать тренировку, её можно добавить за последние 2 дня текущей недели.'
+    ].join('\n')
+  },
+  {
+    title: 'Шаг 3 из 6 — Привычки и Цели',
+    text: [
+      'Ежедневные дела и крупные задачи всегда под рукой.',
+      '',
+      '• <b>Гибкие привычки:</b> на каждый день, по будням или в выбранные дни недели. Пропущенную отметку тоже можно закрыть за последние 2 дня.',
+      '',
+      '• <b>Цели:</b> разбивай задачи на чекбоксы или часы — после учёбы время можно распределять прямо по подцелям.'
+    ].join('\n')
+  },
+  {
+    title: 'Шаг 4 из 6 — Календарь прогресса',
+    text: [
+      'Вся дисциплина собирается в цветной календарь в разделе «Прогресс».',
+      '',
+      '• <b>Цвета дней:</b> красный — без активности, жёлтый — минимум выполнен, зелёный — отличный результат.',
+      '',
+      '• <b>Детали дня:</b> календарь переключается между общей активностью и привычками. Нажатие на любой день открывает его подробную сводку.'
+    ].join('\n')
+  },
+  {
+    title: 'Шаг 5 из 6 — Рейтинг и Чемпионы',
+    text: [
+      'Соревнуйся с другими участниками по учёбе и тренировкам.',
+      '',
+      '• <b>Два зачёта:</b> пьедестал и таблица лидеров за всё время или за текущую неделю (Пн–Вс).',
+      '',
+      '• <b>Итоги недели:</b> каждый понедельник чемпионы прошлой недели фиксируются в отдельном блоке и больше не меняются.'
+    ].join('\n')
+  },
+  {
+    title: 'Шаг 6 из 6 — Магазин, Банк и Синхронизация',
+    text: [
+      'Награды для самомотивации и единый профиль на всех устройствах.',
+      '',
+      '• <b>Магазин:</b> трать ключи на кейсы или полезные предметы для лабиринта (разведка, переброс, щит).',
+      '',
+      '• <b>Банк:</b> условия выплат за тренировки можно настроить позже или вообще не использовать.',
+      '',
+      '• <b>Синхронизация:</b> открывай приложение через этого бота — прогресс общий на телефоне и ПК.'
+    ].join('\n')
+  }
+];
+
+function buildGuideKeyboard(idx) {
+  const nav = [];
+  if (idx > 0) nav.push({ text: '← Назад', callback_data: `guide_${idx - 1}` });
+  if (idx < GUIDE_SLIDES.length - 1) nav.push({ text: 'Дальше →', callback_data: `guide_${idx + 1}` });
+  const rows = [];
+  if (nav.length) rows.push(nav);
+  if (WEBAPP_URL) rows.push([{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]);
+  return { inline_keyboard: rows };
+}
+
+function formatGuideSlide(idx) {
+  const safeIdx = Math.max(0, Math.min(GUIDE_SLIDES.length - 1, Number(idx) || 0));
+  const slide = GUIDE_SLIDES[safeIdx];
+  return {
+    idx: safeIdx,
+    text: `<b>${slide.title}</b>\n\n${slide.text}`,
+    reply_markup: buildGuideKeyboard(safeIdx)
+  };
+}
+
+async function sendStartMessage(chatId) {
+  if (BANNER_URL) {
+    const res = await tgApi('sendPhoto', {
+      chat_id: chatId,
+      photo: BANNER_URL,
+      caption: WELCOME_TEXT,
+      parse_mode: 'HTML',
+      reply_markup: buildMainKeyboard()
+    });
+    if (res && res.ok) return;
+  }
+  await tgApi('sendMessage', {
+    chat_id: chatId,
+    text: WELCOME_TEXT,
+    parse_mode: 'HTML',
+    reply_markup: buildMainKeyboard()
+  });
+}
+
 async function formatUserStats(telegramId) {
   const connected = await connectDB();
-  if (!connected) return '⚠️ База данных сейчас недоступна. Попробуй через минуту.';
+  if (!connected) return 'База данных сейчас недоступна. Попробуй через минуту.';
   const user = await User.findOne({ telegramId });
   const st = user?.data;
   if (!st || !st.stats) {
-    return '📭 Профиль пока пуст.\n\nОткрой <b>StatTrack</b>, пройди быструю настройку — и здесь появится твоя статистика!';
+    return 'Профиль пока пуст.\n\nОткрой <b>StatTrack</b>, пройди быструю настройку — и здесь появится твоя статистика.';
   }
-  const nick = st.profile?.nick || 'Игрок';
+  const nick = escapeHtml(st.profile?.nick || 'Игрок');
   const hrs = ((st.stats.min || 0) / 60).toFixed(1);
   const wk = st.stats.wk || 0;
   const streak = st.streak?.cur || 0;
@@ -481,40 +606,63 @@ async function formatUserStats(telegramId) {
   const habitsCount = Array.isArray(st.habits) ? st.habits.length : 0;
 
   return [
-    `⚔️ <b>Профиль: ${nick}</b>`,
+    `<b>Профиль: ${nick}</b>`,
     ``,
-    `📚 <b>Учёба:</b> ${hrs} ч`,
-    `🏋️ <b>Тренировки:</b> ${wk}`,
-    `🔥 <b>Серия:</b> ${streak} дн. (рекорд: ${bestStreak})`,
-    `🔑 <b>Ключи:</b> ${keys}${chests ? ` • 📦 <b>Кейсы:</b> ${chests}` : ''}`,
-    `✅ <b>Привычек в трекере:</b> ${habitsCount}`,
-    `💰 <b>Банк:</b> ${pend} ₽ к выплате (всего выплачено: ${paid} ₽)`
+    `Учёба: <b>${hrs} ч</b>`,
+    `Тренировки: <b>${wk}</b>`,
+    `Серия: <b>${streak} дн.</b> (рекорд: ${bestStreak})`,
+    `Ключи: <b>${keys}</b>${chests ? ` • Кейсы: <b>${chests}</b>` : ''}`,
+    `Привычек в трекере: <b>${habitsCount}</b>`,
+    `Банк: <b>${pend} ₽</b> к выплате (выплачено: ${paid} ₽)`
   ].join('\n');
 }
 
-const WELCOME_TEXT = [
-  `🔥 <b>Добро пожаловать в StatTrack</b>`,
-  ``,
-  `Твоя система геймификации учёбы, спорта и ежедневных привычек:`,
-  `• 📚 <b>Лабиринт учёбы</b> — 10 врат разного риска, таймер и ключи`,
-  `• 🏋️ <b>Спорт и журнал весов</b> — тренировки, подходы и рекорды`,
-  `• 🎯 <b>Цели и Привычки</b> — календарь дисциплины и контроль дней`,
-  `• 📦 <b>Магазин и Кейсы</b> — тактические предметы за ключи`,
-  ``,
-  `Прогресс автоматически синхронизируется между телефоном и ПК.`,
-  WEBAPP_URL ? `Жми кнопку ниже, чтобы начать 👇` : `Нажми кнопку <b>«Открыть» / «Поиграть»</b> слева внизу 👇`
-].join('\n');
+async function formatWeeklyTop() {
+  const connected = await connectDB();
+  if (!connected) return 'База данных сейчас недоступна. Попробуй через минуту.';
 
-const HELP_TEXT = [
-  `📖 <b>Как работает StatTrack</b>`,
-  ``,
-  `1️⃣ <b>Учёба:</b> выбираешь план в минутах и открываешь врата. Каждые 90 минут учёбы дают 🔑 1 ключ, а из дверей могут выпасть отдых, катка, кейс или тайный выход.`,
-  `2️⃣ <b>Спорт:</b> отмечай тренировки, записывай рабочие веса в журнале и следи за личными рекордами.`,
-  `3️⃣ <b>Привычки и Цели:</b> добавляй ежедневные или кастомные привычки и отслеживай прогресс в календаре (красный / жёлтый / зелёный день).`,
-  `4️⃣ <b>Синхронизация:</b> всегда открывай приложение через этого бота — на телефоне и ПК будет один и тот же аккаунт.`,
-  ``,
-  `Команды бота: /start • /stats • /help`
-].join('\n');
+  const curWeek = getWeekDayKeys(0);
+  const users = await User.find({}).lean();
+  const rows = users.map(u => {
+    const st = u.data || {};
+    const daily = st.daily || {};
+    let studyMin = 0;
+    let workouts = 0;
+    for (const k of curWeek.keys) {
+      if (daily[k]) {
+        studyMin += Number(daily[k].min) || 0;
+        workouts += Number(daily[k].wk) || 0;
+      }
+    }
+    return {
+      nick: escapeHtml(st?.profile?.nick || 'Игрок'),
+      studyMin,
+      workouts
+    };
+  });
+
+  const studyTop = rows.filter(r => r.studyMin > 0).sort((a, b) => b.studyMin - a.studyMin).slice(0, 5);
+  const workTop = rows.filter(r => r.workouts > 0).sort((a, b) => b.workouts - a.workouts).slice(0, 5);
+
+  const lines = [`<b>Топ недели (${curWeek.range})</b>`, ``];
+
+  lines.push(`<b>Учёба:</b>`);
+  if (studyTop.length) {
+    studyTop.forEach((u, i) => lines.push(`${i + 1}. ${u.nick} — ${formatHm(u.studyMin)}`));
+  } else {
+    lines.push(`Пока нет записей за эту неделю.`);
+  }
+
+  lines.push(``);
+  lines.push(`<b>Тренировки:</b>`);
+  if (workTop.length) {
+    workTop.forEach((u, i) => lines.push(`${i + 1}. ${u.nick} — ${u.workouts} тр.`));
+  } else {
+    lines.push(`Пока нет тренировок за эту неделю.`);
+  }
+
+  return lines.join('\n');
+}
 
 app.post('/api/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -525,15 +673,10 @@ app.post('/api/webhook', async (req, res) => {
     if (update.message && update.message.chat) {
       const chatId = update.message.chat.id;
       const userId = update.message.from?.id;
-      const text = (update.message.text || '').trim().split(/\s+/)[0].toLowerCase();
+      const text = (update.message.text || '').trim().split(/\s+/)[0].toLowerCase().split('@')[0];
 
       if (text === '/start' || text === '/menu') {
-        await tgApi('sendMessage', {
-          chat_id: chatId,
-          text: WELCOME_TEXT,
-          parse_mode: 'HTML',
-          reply_markup: buildMainKeyboard()
-        });
+        await sendStartMessage(chatId);
       } else if (text === '/stats') {
         const statsMsg = await formatUserStats(userId);
         await tgApi('sendMessage', {
@@ -542,28 +685,39 @@ app.post('/api/webhook', async (req, res) => {
           parse_mode: 'HTML',
           reply_markup: buildMainKeyboard()
         });
-      } else if (text === '/help') {
+      } else if (text === '/top') {
+        const topMsg = await formatWeeklyTop();
         await tgApi('sendMessage', {
           chat_id: chatId,
-          text: HELP_TEXT,
+          text: topMsg,
           parse_mode: 'HTML',
           reply_markup: buildMainKeyboard()
+        });
+      } else if (text === '/help') {
+        const slide = formatGuideSlide(0);
+        await tgApi('sendMessage', {
+          chat_id: chatId,
+          text: slide.text,
+          parse_mode: 'HTML',
+          reply_markup: slide.reply_markup
         });
       } else {
         await tgApi('sendMessage', {
           chat_id: chatId,
-          text: 'Используй команды /start, /stats, /help или открой приложение 👇',
+          text: 'Используй команды /start, /stats, /top, /help или открой приложение ниже.',
           reply_markup: buildMainKeyboard()
         });
       }
     } else if (update.callback_query) {
       const cq = update.callback_query;
       const chatId = cq.message?.chat?.id;
+      const messageId = cq.message?.message_id;
       const userId = cq.from?.id;
+      const data = String(cq.data || '');
       await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
       if (!chatId) return;
 
-      if (cq.data === 'stats') {
+      if (data === 'stats') {
         const statsMsg = await formatUserStats(userId);
         await tgApi('sendMessage', {
           chat_id: chatId,
@@ -571,13 +725,42 @@ app.post('/api/webhook', async (req, res) => {
           parse_mode: 'HTML',
           reply_markup: buildMainKeyboard()
         });
-      } else if (cq.data === 'help') {
+      } else if (data === 'top') {
+        const topMsg = await formatWeeklyTop();
         await tgApi('sendMessage', {
           chat_id: chatId,
-          text: HELP_TEXT,
+          text: topMsg,
           parse_mode: 'HTML',
           reply_markup: buildMainKeyboard()
         });
+      } else if (data.startsWith('guide_')) {
+        const idx = parseInt(data.slice(6), 10) || 0;
+        const slide = formatGuideSlide(idx);
+        const isPhotoMsg = Boolean(cq.message?.photo);
+        if (messageId && !isPhotoMsg) {
+          const edited = await tgApi('editMessageText', {
+            chat_id: chatId,
+            message_id: messageId,
+            text: slide.text,
+            parse_mode: 'HTML',
+            reply_markup: slide.reply_markup
+          });
+          if (!edited || !edited.ok) {
+            await tgApi('sendMessage', {
+              chat_id: chatId,
+              text: slide.text,
+              parse_mode: 'HTML',
+              reply_markup: slide.reply_markup
+            });
+          }
+        } else {
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: slide.text,
+            parse_mode: 'HTML',
+            reply_markup: slide.reply_markup
+          });
+        }
       }
     }
   } catch (e) {
@@ -589,9 +772,10 @@ async function setupTelegramBot() {
   if (!BOT_TOKEN) return;
   await tgApi('setMyCommands', {
     commands: [
-      { command: 'start', description: '🔥 Запустить StatTrack' },
-      { command: 'stats', description: '📊 Моя статистика и баланс' },
-      { command: 'help', description: '❓ Как всё работает' }
+      { command: 'start', description: 'Открыть StatTrack' },
+      { command: 'stats', description: 'Моя статистика' },
+      { command: 'top', description: 'Топ недели' },
+      { command: 'help', description: 'Краткий гид по приложению' }
     ]
   });
   await tgApi('setWebhook', {
