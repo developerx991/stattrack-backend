@@ -143,6 +143,15 @@ const visitorSchema = new mongoose.Schema({
 });
 const Visitor = mongoose.model('Visitor', visitorSchema);
 
+const weeklyResultSchema = new mongoose.Schema({
+  weekKey: { type: String, required: true, unique: true },
+  weekRange: { type: String, default: '' },
+  finalizedAt: { type: Number, default: Date.now },
+  studyTop: { type: Array, default: [] },
+  workTop: { type: Array, default: [] }
+});
+const WeeklyResult = mongoose.model('WeeklyResult', weeklyResultSchema);
+
 function verifyTelegramWebAppData(telegramInitData) {
   if (!telegramInitData || !BOT_TOKEN) return { ok: false, reason: !BOT_TOKEN ? 'no_token' : 'empty_initData' };
   try {
@@ -304,19 +313,21 @@ app.post('/api/ping', async (req, res) => {
   }
 });
 
-function getCurrentWeekDayKeys() {
+function getWeekDayKeys(weekOffset = 0) {
   const now = new Date();
   const day = (now.getDay() + 6) % 7; // 0 = Пн .. 6 = Вс
-  const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
+  const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + weekOffset * 7);
   const keys = [];
   for (let i = 0; i < 7; i++) {
     const d = new Date(mon.getTime() + i * 86400000);
     keys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
   }
-  return keys;
+  const sun = new Date(mon.getTime() + 6 * 86400000);
+  const fmtDM = d => `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+  return { weekKey: keys[0], keys, range: `${fmtDM(mon)} – ${fmtDM(sun)}` };
 }
 
-// 2. Отдача общего рейтинга (все время + текущая неделя Пн–Вс) и списка визитов (для админа)
+// 2. Отдача общего рейтинга (все время + текущая неделя + замороженные итоги прошлой недели)
 app.post('/api/leaderboard', async (req, res) => {
   const connected = await connectDB();
   if (!connected) {
@@ -325,10 +336,13 @@ app.post('/api/leaderboard', async (req, res) => {
 
   try {
     const isAdmin = Boolean(req.body?.admin);
-    const weekKeys = getCurrentWeekDayKeys();
-    const [users, visitors] = await Promise.all([
+    const curWeek = getWeekDayKeys(0);
+    const prevWeekInfo = getWeekDayKeys(-1);
+
+    const [users, visitors, existingPrev] = await Promise.all([
       User.find({}).lean(),
-      Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean()
+      Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean(),
+      WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean()
     ]);
 
     const usernameByTgId = new Map();
@@ -342,7 +356,7 @@ app.post('/api/leaderboard', async (req, res) => {
         const daily = st.daily || {};
         let weekStudyMin = 0;
         let weekWorkouts = 0;
-        for (const k of weekKeys) {
+        for (const k of curWeek.keys) {
           if (daily[k]) {
             weekStudyMin += Number(daily[k].min) || 0;
             weekWorkouts += Number(daily[k].wk) || 0;
@@ -361,7 +375,52 @@ app.post('/api/leaderboard', async (req, res) => {
       })
       .filter(u => u.studyMin > 0 || u.workouts > 0 || u.streak > 0 || u.weekStudyMin > 0 || u.weekWorkouts > 0);
 
-    res.json({ leaderboard, visitors: isAdmin ? visitors : [] });
+    // Фиксируем итоги прошлой недели один раз в MongoDB — после этого они больше никогда не меняются
+    let prevWeek = existingPrev;
+    if (!prevWeek) {
+      const prevRows = users.map(u => {
+        const st = u.data || {};
+        const daily = st.daily || {};
+        let studyMin = 0;
+        let workouts = 0;
+        for (const k of prevWeekInfo.keys) {
+          if (daily[k]) {
+            studyMin += Number(daily[k].min) || 0;
+            workouts += Number(daily[k].wk) || 0;
+          }
+        }
+        return {
+          user_id: u.telegramId,
+          username: usernameByTgId.get(Number(u.telegramId)) || '',
+          nick: st?.profile?.nick || 'Игрок',
+          studyMin,
+          workouts
+        };
+      });
+
+      const studyTop = prevRows.filter(x => x.studyMin > 0).sort((a, b) => b.studyMin - a.studyMin).slice(0, 20);
+      const workTop = prevRows.filter(x => x.workouts > 0).sort((a, b) => b.workouts - a.workouts).slice(0, 20);
+
+      try {
+        prevWeek = await WeeklyResult.findOneAndUpdate(
+          { weekKey: prevWeekInfo.weekKey },
+          {
+            $setOnInsert: {
+              weekKey: prevWeekInfo.weekKey,
+              weekRange: prevWeekInfo.range,
+              finalizedAt: Date.now(),
+              studyTop,
+              workTop
+            }
+          },
+          { upsert: true, new: true }
+        ).lean();
+      } catch (e) {
+        prevWeek = await WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean();
+      }
+    }
+
+    res.json({ leaderboard, visitors: isAdmin ? visitors : [], prevWeek });
   } catch (error) {
     console.error('Ошибка /api/leaderboard:', error.message);
     res.status(500).json({ error: 'Ошибка загрузки рейтинга: ' + error.message });
