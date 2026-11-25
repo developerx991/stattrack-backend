@@ -147,6 +147,7 @@ const weeklyResultSchema = new mongoose.Schema({
   weekKey: { type: String, required: true, unique: true },
   weekRange: { type: String, default: '' },
   finalizedAt: { type: Number, default: Date.now },
+  summarySent: { type: Boolean, default: false },
   studyTop: { type: Array, default: [] },
   workTop: { type: Array, default: [] }
 });
@@ -335,7 +336,59 @@ function getWeekDayKeys(weekOffset = 0) {
   return { weekKey: keys[0], keys, range: `${fmtDM(mon)} – ${fmtDM(sun)}` };
 }
 
-// 2. Отдача общего рейтинга (все время + текущая неделя + замороженные итоги прошлой недели)
+async function ensurePrevWeekResult(users, usernameByTgId, prevWeekInfo) {
+  let prevWeek = await WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean();
+  if (prevWeek) return prevWeek;
+
+  const prevRows = users.map(u => {
+    const st = u.data || {};
+    const daily = st.daily || {};
+    let studyMin = 0;
+    let workouts = 0;
+    for (const k of prevWeekInfo.keys) {
+      if (daily[k]) {
+        studyMin += Number(daily[k].min) || 0;
+        workouts += Number(daily[k].wk) || 0;
+      }
+    }
+    return {
+      user_id: u.telegramId,
+      username: usernameByTgId.get(Number(u.telegramId)) || '',
+      nick: st?.profile?.nick || 'Игрок',
+      nickStyle: st?.profile?.nickStyle || '',
+      frame: st?.profile?.frame || '',
+      badge: st?.profile?.badge || '',
+      ava: st?.profile?.ava || 'crown',
+      studyMin,
+      workouts
+    };
+  });
+
+  const studyTop = prevRows.filter(x => x.studyMin > 0).sort((a, b) => b.studyMin - a.studyMin).slice(0, 20);
+  const workTop = prevRows.filter(x => x.workouts > 0).sort((a, b) => b.workouts - a.workouts).slice(0, 20);
+
+  try {
+    prevWeek = await WeeklyResult.findOneAndUpdate(
+      { weekKey: prevWeekInfo.weekKey },
+      {
+        $setOnInsert: {
+          weekKey: prevWeekInfo.weekKey,
+          weekRange: prevWeekInfo.range,
+          finalizedAt: Date.now(),
+          summarySent: false,
+          studyTop,
+          workTop
+        }
+      },
+      { upsert: true, new: true }
+    ).lean();
+  } catch (e) {
+    prevWeek = await WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean();
+  }
+  return prevWeek;
+}
+
+// 2. Отдача общего рейтинга (все время + текущая неделя + замороженные итоги прошлой недели + косметика и короны чемпионов)
 app.post('/api/leaderboard', async (req, res) => {
   const connected = await connectDB();
   if (!connected) {
@@ -347,16 +400,19 @@ app.post('/api/leaderboard', async (req, res) => {
     const curWeek = getWeekDayKeys(0);
     const prevWeekInfo = getWeekDayKeys(-1);
 
-    const [users, visitors, existingPrev] = await Promise.all([
+    const [users, visitors] = await Promise.all([
       User.find({}).lean(),
-      Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean(),
-      WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean()
+      Visitor.find({}).sort({ lastSeen: -1 }).limit(150).lean()
     ]);
 
     const usernameByTgId = new Map();
     for (const v of visitors) {
       if (v.user_id && v.username) usernameByTgId.set(Number(v.user_id), v.username);
     }
+
+    const prevWeek = await ensurePrevWeekResult(users, usernameByTgId, prevWeekInfo);
+    const champStudyId = prevWeek?.studyTop?.[0]?.user_id ? Number(prevWeek.studyTop[0].user_id) : null;
+    const champWorkId = prevWeek?.workTop?.[0]?.user_id ? Number(prevWeek.workTop[0].user_id) : null;
 
     const leaderboard = users
       .map(u => {
@@ -370,11 +426,19 @@ app.post('/api/leaderboard', async (req, res) => {
             weekWorkouts += Number(daily[k].wk) || 0;
           }
         }
+        const uidNum = Number(u.telegramId);
+        const champTitles = [];
+        if (champStudyId && uidNum === champStudyId) champTitles.push('study');
+        if (champWorkId && uidNum === champWorkId) champTitles.push('work');
         return {
-          user_id: u.telegramId,
-          username: usernameByTgId.get(Number(u.telegramId)) || '',
+          user_id: uidNum,
+          username: usernameByTgId.get(uidNum) || '',
           nick: st?.profile?.nick || 'Игрок',
           nickStyle: st?.profile?.nickStyle || '',
+          frame: st?.profile?.frame || '',
+          badge: st?.profile?.badge || '',
+          ava: st?.profile?.ava || 'crown',
+          champTitles,
           studyMin: st?.stats?.min || 0,
           workouts: st?.stats?.wk || 0,
           weekStudyMin,
@@ -384,53 +448,7 @@ app.post('/api/leaderboard', async (req, res) => {
       })
       .filter(u => u.studyMin > 0 || u.workouts > 0 || u.streak > 0 || u.weekStudyMin > 0 || u.weekWorkouts > 0);
 
-    // Фиксируем итоги прошлой недели один раз в MongoDB — после этого они больше никогда не меняются
-    let prevWeek = existingPrev;
-    if (!prevWeek) {
-      const prevRows = users.map(u => {
-        const st = u.data || {};
-        const daily = st.daily || {};
-        let studyMin = 0;
-        let workouts = 0;
-        for (const k of prevWeekInfo.keys) {
-          if (daily[k]) {
-            studyMin += Number(daily[k].min) || 0;
-            workouts += Number(daily[k].wk) || 0;
-          }
-        }
-        return {
-          user_id: u.telegramId,
-          username: usernameByTgId.get(Number(u.telegramId)) || '',
-          nick: st?.profile?.nick || 'Игрок',
-          nickStyle: st?.profile?.nickStyle || '',
-          studyMin,
-          workouts
-        };
-      });
-
-      const studyTop = prevRows.filter(x => x.studyMin > 0).sort((a, b) => b.studyMin - a.studyMin).slice(0, 20);
-      const workTop = prevRows.filter(x => x.workouts > 0).sort((a, b) => b.workouts - a.workouts).slice(0, 20);
-
-      try {
-        prevWeek = await WeeklyResult.findOneAndUpdate(
-          { weekKey: prevWeekInfo.weekKey },
-          {
-            $setOnInsert: {
-              weekKey: prevWeekInfo.weekKey,
-              weekRange: prevWeekInfo.range,
-              finalizedAt: Date.now(),
-              studyTop,
-              workTop
-            }
-          },
-          { upsert: true, new: true }
-        ).lean();
-      } catch (e) {
-        prevWeek = await WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean();
-      }
-    }
-
-    res.json({ leaderboard, visitors: isAdmin ? visitors : [], prevWeek });
+    res.json({ leaderboard, visitors: isAdmin ? visitors : [], prevWeek, champStudyId, champWorkId });
   } catch (error) {
     console.error('Ошибка /api/leaderboard:', error.message);
     res.status(500).json({ error: 'Ошибка загрузки рейтинга: ' + error.message });
@@ -444,6 +462,40 @@ app.post('/api/leaderboard', async (req, res) => {
 const WEBAPP_URL = (process.env.WEBAPP_URL || '').trim();
 const BANNER_URL = (process.env.BANNER_URL || '').trim();
 const RENDER_URL = (process.env.RENDER_EXTERNAL_URL || 'https://stattrack-backend.onrender.com').replace(/\/+$/, '');
+const ADMIN_IDS = new Set(
+  String(process.env.ADMIN_IDS || '')
+    .split(',')
+    .map(s => Number(s.trim()))
+    .filter(n => Number.isFinite(n) && n > 0)
+);
+const isAdminUser = userId => ADMIN_IDS.has(Number(userId));
+const pendingAnnounces = new Map();
+
+function cleanupPendingAnnounces() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [k, v] of pendingAnnounces.entries()) {
+    if (v.createdAt < cutoff) pendingAnnounces.delete(k);
+  }
+}
+
+async function getAllRecipientIds() {
+  const connected = await connectDB();
+  if (!connected) return [];
+  const [users, visitors] = await Promise.all([
+    User.find({}, { telegramId: 1 }).lean(),
+    Visitor.find({ user_id: { $ne: null } }, { user_id: 1 }).lean()
+  ]);
+  const ids = new Set();
+  for (const u of users) {
+    const id = Number(u.telegramId);
+    if (Number.isFinite(id) && id > 0) ids.add(id);
+  }
+  for (const v of visitors) {
+    const id = Number(v.user_id);
+    if (Number.isFinite(id) && id > 0) ids.add(id);
+  }
+  return Array.from(ids);
+}
 
 async function tgApi(method, payload) {
   if (!BOT_TOKEN) return null;
@@ -711,6 +763,88 @@ app.post('/api/webhook', async (req, res) => {
           parse_mode: 'HTML',
           reply_markup: slide.reply_markup
         });
+      } else if (text === '/myid') {
+        await tgApi('sendMessage', {
+          chat_id: chatId,
+          text: `Твой Telegram ID: <code>${userId}</code>`,
+          parse_mode: 'HTML'
+        });
+      } else if (text === '/announce') {
+        if (!isAdminUser(userId)) {
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: 'Используй команды /start, /stats, /top, /help или открой приложение ниже.',
+            reply_markup: buildMainKeyboard()
+          });
+          return;
+        }
+        cleanupPendingAnnounces();
+        const rawText = String(update.message.text || '');
+        const bodyText = rawText.replace(/^\/announce(?:@\S+)?\s*/i, '').trim();
+        const replyMsg = update.message.reply_to_message;
+
+        if (!bodyText && !replyMsg) {
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: [
+              '<b>Как сделать рассылку:</b>',
+              '',
+              '1. Напиши <code>/announce Текст сообщения</code>',
+              '2. Или ответь командой <code>/announce</code> на любой свой пост (можно с картинкой и форматированием) — бот разошлёт его копию всем.',
+              '',
+              'Перед отправкой бот покажет предпросмотр и спросит подтверждение.'
+            ].join('\n'),
+            parse_mode: 'HTML'
+          });
+          return;
+        }
+
+        const recipients = await getAllRecipientIds();
+        const draftId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+        if (replyMsg && !bodyText) {
+          pendingAnnounces.set(draftId, {
+            mode: 'copy',
+            fromChatId: chatId,
+            sourceMessageId: replyMsg.message_id,
+            createdAt: Date.now()
+          });
+          await tgApi('copyMessage', {
+            chat_id: chatId,
+            from_chat_id: chatId,
+            message_id: replyMsg.message_id,
+            reply_markup: WEBAPP_URL ? { inline_keyboard: [[{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]] } : undefined
+          });
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: `👆 <b>Предпросмотр рассылки</b>\nПолучателей в базе: <b>${recipients.length}</b>. Отправляем?`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: `Отправить всем (${recipients.length})`, callback_data: `ann_send_${draftId}` },
+                { text: 'Отмена', callback_data: `ann_cancel_${draftId}` }
+              ]]
+            }
+          });
+        } else {
+          pendingAnnounces.set(draftId, {
+            mode: 'text',
+            text: bodyText,
+            fromChatId: chatId,
+            createdAt: Date.now()
+          });
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: `<b>Предпросмотр рассылки (${recipients.length} чел.):</b>\n\n${escapeHtml(bodyText)}`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: `Отправить всем (${recipients.length})`, callback_data: `ann_send_${draftId}` },
+                { text: 'Отмена', callback_data: `ann_cancel_${draftId}` }
+              ]]
+            }
+          });
+        }
       } else {
         await tgApi('sendMessage', {
           chat_id: chatId,
@@ -743,6 +877,86 @@ app.post('/api/webhook', async (req, res) => {
           parse_mode: 'HTML',
           reply_markup: buildMainKeyboard()
         });
+      } else if (data.startsWith('ann_cancel_')) {
+        if (!isAdminUser(userId)) return;
+        const draftId = data.slice(11);
+        pendingAnnounces.delete(draftId);
+        if (messageId) {
+          await tgApi('editMessageText', {
+            chat_id: chatId,
+            message_id: messageId,
+            text: '❌ Рассылка отменена.'
+          });
+        }
+      } else if (data.startsWith('ann_send_')) {
+        if (!isAdminUser(userId)) return;
+        const draftId = data.slice(9);
+        const draft = pendingAnnounces.get(draftId);
+        if (!draft) {
+          if (messageId) {
+            await tgApi('editMessageText', {
+              chat_id: chatId,
+              message_id: messageId,
+              text: '⚠️ Черновик устарел или уже отправлен. Сформируй команду /announce заново.'
+            });
+          }
+          return;
+        }
+        pendingAnnounces.delete(draftId);
+
+        const recipients = await getAllRecipientIds();
+        if (messageId) {
+          await tgApi('editMessageText', {
+            chat_id: chatId,
+            message_id: messageId,
+            text: `⏳ Отправляю рассылку (${recipients.length} чел.)…`
+          });
+        }
+
+        const openMarkup = WEBAPP_URL
+          ? { inline_keyboard: [[{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]] }
+          : undefined;
+
+        let okCount = 0;
+        let failCount = 0;
+        for (const targetId of recipients) {
+          let r = null;
+          if (draft.mode === 'copy') {
+            r = await tgApi('copyMessage', {
+              chat_id: targetId,
+              from_chat_id: draft.fromChatId,
+              message_id: draft.sourceMessageId,
+              reply_markup: openMarkup
+            });
+          } else {
+            r = await tgApi('sendMessage', {
+              chat_id: targetId,
+              text: escapeHtml(draft.text),
+              parse_mode: 'HTML',
+              reply_markup: openMarkup
+            });
+          }
+          if (r && r.ok) okCount++;
+          else failCount++;
+          await new Promise(resolve => setTimeout(resolve, 60));
+        }
+
+        const report = [
+          '✅ <b>Рассылка завершена!</b>',
+          `Доставлено: <b>${okCount}</b> из <b>${recipients.length}</b>`,
+          failCount ? `Не доставлено (бот заблокирован/удалён): <b>${failCount}</b>` : ''
+        ].filter(Boolean).join('\n');
+
+        if (messageId) {
+          await tgApi('editMessageText', {
+            chat_id: chatId,
+            message_id: messageId,
+            text: report,
+            parse_mode: 'HTML'
+          });
+        } else {
+          await tgApi('sendMessage', { chat_id: chatId, text: report, parse_mode: 'HTML' });
+        }
       } else if (data.startsWith('guide_')) {
         const idx = parseInt(data.slice(6), 10) || 0;
         const slide = formatGuideSlide(idx);
@@ -879,6 +1093,107 @@ ${escapeHtml(item.label)}
   }
 }
 setInterval(checkScheduledTimers, 10000);
+
+
+// 4. Авто-сводка в понедельник утром в 07:50 (по SUMMARY_TZ_OFFSET, по умолчанию UTC+3)
+const SUMMARY_TZ_OFFSET = Number.isFinite(Number(process.env.SUMMARY_TZ_OFFSET)) ? Number(process.env.SUMMARY_TZ_OFFSET) : 3;
+let mondaySummaryBusy = false;
+
+async function checkMondaySummary() {
+  if (mondaySummaryBusy || !BOT_TOKEN || mongoose.connection.readyState !== 1) return;
+  const localNow = new Date(Date.now() + SUMMARY_TZ_OFFSET * 3600 * 1000);
+  const dow = localNow.getUTCDay(); // 1 = Понедельник
+  const minsOfDay = localNow.getUTCHours() * 60 + localNow.getUTCMinutes();
+  // Запускаем в понедельник начиная с 07:50 (окно до 14:00 на случай сна сервера)
+  if (dow !== 1 || minsOfDay < 7 * 60 + 50 || minsOfDay > 14 * 60) return;
+
+  mondaySummaryBusy = true;
+  try {
+    const prevWeekInfo = getWeekDayKeys(-1);
+    const existing = await WeeklyResult.findOne({ weekKey: prevWeekInfo.weekKey }).lean();
+    if (existing && existing.summarySent) return;
+
+    const [users, visitors] = await Promise.all([
+      User.find({}).lean(),
+      Visitor.find({}).lean()
+    ]);
+    const usernameByTgId = new Map();
+    for (const v of visitors) {
+      if (v.user_id && v.username) usernameByTgId.set(Number(v.user_id), v.username);
+    }
+
+    const prevWeek = await ensurePrevWeekResult(users, usernameByTgId, prevWeekInfo);
+    if (!prevWeek) return;
+
+    // Атомарная блокировка, чтобы сводка ушла ровно 1 раз
+    const locked = await WeeklyResult.findOneAndUpdate(
+      { weekKey: prevWeekInfo.weekKey, summarySent: { $ne: true } },
+      { $set: { summarySent: true } },
+      { new: true }
+    ).lean();
+    if (!locked) return;
+
+    const studyAll = users.map(u => {
+      const daily = u.data?.daily || {};
+      let min = 0, wk = 0;
+      for (const k of prevWeekInfo.keys) {
+        if (daily[k]) {
+          min += Number(daily[k].min) || 0;
+          wk += Number(daily[k].wk) || 0;
+        }
+      }
+      return { id: Number(u.telegramId), min, wk };
+    });
+
+    const studyRankList = studyAll.filter(x => x.min > 0).sort((a, b) => b.min - a.min);
+    const workRankList = studyAll.filter(x => x.wk > 0).sort((a, b) => b.wk - a.wk);
+    const champStudy = prevWeek.studyTop?.[0] || null;
+    const champWork = prevWeek.workTop?.[0] || null;
+
+    let sentCount = 0;
+    for (const u of users) {
+      const tgId = Number(u.telegramId);
+      if (!Number.isFinite(tgId) || !u.data) continue;
+
+      const myStat = studyAll.find(x => x.id === tgId) || { min: 0, wk: 0 };
+      const sPos = studyRankList.findIndex(x => x.id === tgId) + 1;
+      const wPos = workRankList.findIndex(x => x.id === tgId) + 1;
+      const isChamp = (champStudy && Number(champStudy.user_id) === tgId) || (champWork && Number(champWork.user_id) === tgId);
+
+      const lines = [
+        `<b>Итоги прошлой недели (${prevWeekInfo.range})</b>`,
+        ``,
+        `Учёба: <b>${formatHm(myStat.min)}</b>${sPos ? ` (#${sPos} в топе)` : ''}`,
+        `Тренировки: <b>${myStat.wk}</b>${wPos ? ` (#${wPos} в топе)` : ''}`,
+        ``,
+        `<b>Чемпионы недели:</b>`,
+        `• Учёба: ${champStudy ? `<b>${escapeHtml(champStudy.nick)}</b> — ${formatHm(champStudy.studyMin)}` : 'нет лидера'}`,
+        `• Спорт: ${champWork ? `<b>${escapeHtml(champWork.nick)}</b> — ${champWork.workouts} тр.` : 'нет лидера'}`
+      ];
+
+      if (isChamp) {
+        lines.push(``);
+        lines.push(`👑 Поздравляем! Ты чемпион прошлой недели — временная корона уже закреплена рядом с твоим ником на всю неделю.`);
+      }
+
+      await tgApi('sendMessage', {
+        chat_id: tgId,
+        text: lines.join('\n'),
+        parse_mode: 'HTML',
+        reply_markup: WEBAPP_URL ? { inline_keyboard: [[{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]] } : undefined
+      });
+      sentCount++;
+      await new Promise(r => setTimeout(r, 60));
+    }
+    console.log(`📨 Понедельничная сводка за ${prevWeekInfo.range} отправлена (${sentCount} польз.)`);
+  } catch (e) {
+    console.error('Ошибка понедельничной сводки:', e.message);
+  } finally {
+    mondaySummaryBusy = false;
+  }
+}
+setInterval(checkMondaySummary, 60000);
+setTimeout(checkMondaySummary, 8000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
