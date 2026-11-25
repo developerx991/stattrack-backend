@@ -152,6 +152,14 @@ const weeklyResultSchema = new mongoose.Schema({
 });
 const WeeklyResult = mongoose.model('WeeklyResult', weeklyResultSchema);
 
+const scheduledTimerSchema = new mongoose.Schema({
+  telegramId: { type: Number, required: true, unique: true },
+  endAt: { type: Number, required: true },
+  label: { type: String, default: 'Таймер завершён' },
+  kind: { type: String, default: 'study' }
+});
+const ScheduledTimer = mongoose.model('ScheduledTimer', scheduledTimerSchema);
+
 function verifyTelegramWebAppData(telegramInitData) {
   if (!telegramInitData || !BOT_TOKEN) return { ok: false, reason: !BOT_TOKEN ? 'no_token' : 'empty_initData' };
   try {
@@ -314,7 +322,7 @@ app.post('/api/ping', async (req, res) => {
 });
 
 function getWeekDayKeys(weekOffset = 0) {
-  const now = new Date();
+  const now = new Date(Date.now() - 3 * 3600 * 1000); // Игровой день обновляется в 03:00
   const day = (now.getDay() + 6) % 7; // 0 = Пн .. 6 = Вс
   const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + weekOffset * 7);
   const keys = [];
@@ -366,6 +374,7 @@ app.post('/api/leaderboard', async (req, res) => {
           user_id: u.telegramId,
           username: usernameByTgId.get(Number(u.telegramId)) || '',
           nick: st?.profile?.nick || 'Игрок',
+          nickStyle: st?.profile?.nickStyle || '',
           studyMin: st?.stats?.min || 0,
           workouts: st?.stats?.wk || 0,
           weekStudyMin,
@@ -393,6 +402,7 @@ app.post('/api/leaderboard', async (req, res) => {
           user_id: u.telegramId,
           username: usernameByTgId.get(Number(u.telegramId)) || '',
           nick: st?.profile?.nick || 'Игрок',
+          nickStyle: st?.profile?.nickStyle || '',
           studyMin,
           workouts
         };
@@ -784,6 +794,91 @@ async function setupTelegramBot() {
   });
   console.log(`🤖 Telegram-бот настроен (webhook: ${RENDER_URL}/api/webhook)`);
 }
+
+
+// 3. Планирование Telegram-уведомления по окончанию таймера (учёба / отдых / разминка)
+app.post('/api/timer/schedule', async (req, res) => {
+  const { initData, user_id, endAt, label, kind } = req.body || {};
+  if (!BOT_TOKEN) return res.status(500).json({ ok: false });
+  const auth = verifyTelegramWebAppData(initData);
+  if (!auth.ok) return res.status(403).json({ ok: false });
+
+  const tgId = extractTelegramUserId(initData, user_id);
+  const endTs = Number(endAt);
+  if (!Number.isFinite(tgId) || !Number.isFinite(endTs) || endTs <= Date.now()) {
+    return res.status(400).json({ ok: false });
+  }
+
+  const connected = await connectDB();
+  if (!connected) return res.status(503).json({ ok: false });
+
+  try {
+    await ScheduledTimer.findOneAndUpdate(
+      { telegramId: tgId },
+      {
+        telegramId: tgId,
+        endAt: endTs,
+        label: String(label || 'Таймер завершён').slice(0, 120),
+        kind: String(kind || 'study').slice(0, 24)
+      },
+      { upsert: true }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Ошибка /api/timer/schedule:', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.post('/api/timer/cancel', async (req, res) => {
+  const { initData, user_id } = req.body || {};
+  if (!BOT_TOKEN) return res.status(500).json({ ok: false });
+  const auth = verifyTelegramWebAppData(initData);
+  if (!auth.ok) return res.status(403).json({ ok: false });
+
+  const tgId = extractTelegramUserId(initData, user_id);
+  if (!Number.isFinite(tgId)) return res.status(400).json({ ok: false });
+
+  const connected = await connectDB();
+  if (!connected) return res.status(503).json({ ok: false });
+
+  try {
+    await ScheduledTimer.deleteOne({ telegramId: tgId });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+let timerPollBusy = false;
+async function checkScheduledTimers() {
+  if (timerPollBusy || !BOT_TOKEN || mongoose.connection.readyState !== 1) return;
+  timerPollBusy = true;
+  try {
+    const now = Date.now();
+    const due = await ScheduledTimer.find({ endAt: { $lte: now } }).limit(30).lean();
+    for (const item of due) {
+      const removed = await ScheduledTimer.findOneAndDelete({ _id: item._id, endAt: item.endAt });
+      if (!removed) continue;
+      const prefix = item.kind === 'rest' ? '🔥 Перерыв завершён!' : item.kind === 'warmup' ? '🧘 Разминка завершена!' : '⏰ Время вышло!';
+      const msg = `<b>${prefix}</b>
+${escapeHtml(item.label)}
+
+Возвращайся в StatTrack, чтобы открыть следующие врата.`;
+      await tgApi('sendMessage', {
+        chat_id: item.telegramId,
+        text: msg,
+        parse_mode: 'HTML',
+        reply_markup: WEBAPP_URL ? { inline_keyboard: [[{ text: 'Открыть StatTrack', web_app: { url: WEBAPP_URL } }]] } : undefined
+      });
+    }
+  } catch (e) {
+    console.error('Ошибка рассылки таймеров:', e.message);
+  } finally {
+    timerPollBusy = false;
+  }
+}
+setInterval(checkScheduledTimers, 10000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
